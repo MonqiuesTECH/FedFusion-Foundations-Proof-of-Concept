@@ -1,0 +1,13 @@
+{
+  "candidate_id": "cand-ada-001",
+  "full_name": "Ada Lovelace",
+  "email": "ada@example.gov",
+  "resume_uri": "s3://bucket/resumes/ada.pdf",
+  "scores": { "experience": 0.82, "skills": 0.91, "education": 0.75, "clearance": 0.60 },
+  "total_score": 0.83,
+  "rank": 1,
+  "fields": { "skills": ["Go", "CICS", "ServiceNow"], "years_experience": 7, "location": "VA" },
+  "idempotency_key": "6d6f4a3f7e3f1a9b2c5f4e9f0a3b4c5d6e7f8a9b0c1d2e3f4a5b6c7d8e9f0a1b",
+  "job_id": "REQ-2025-042",
+  "trace_id": "f9f6b0b6-9fbd-4a01-8b0b-3b7b7b8e2a77"
+}
