@@ -1,30 +1,73 @@
 # app.py
-import streamlit as st
-import pandas as pd
-from pydantic import BaseModel, constr
-from typing import Dict, List, Optional, Tuple
+# FedFusion POC — Streamlit app with transparent scoring + agentic chatbot (LLM optional)
+
+import os, io, re, json, time, uuid, hashlib, random, sqlite3
 from datetime import datetime
 from pathlib import Path
-import hashlib, uuid, time, random, re, io, json, os, sqlite3
+from typing import Dict, List, Optional, Tuple
 
-# ---- resume parsers
-from pdfminer.high_level import extract_text as pdf_extract_text
-from docx import Document
-
-# LangChain (optional — we gracefully fall back if Azure/OpenAI env isn't set)
-from langchain.tools import Tool
-from langchain.agents import initialize_agent, AgentType
-from langchain_openai.chat_models.azure import AzureChatOpenAI
-from langchain.memory import ConversationBufferMemory
-
+import pandas as pd
+import streamlit as st
+from pydantic import BaseModel, constr
 from dotenv import load_dotenv
-load_dotenv()
 
+load_dotenv()
 st.set_page_config(page_title="FedFusion POC", layout="wide")
 
-# =========================
+# =============================================================================
+# Optional PDF/DOCX parsers (graceful fallbacks)
+# =============================================================================
+PDF_BACKEND = "none"
+DOCX_BACKEND = "none"
+
+pdf_extract_text = None
+try:
+    from pdfminer.high_level import extract_text as _pdf_extract_text
+    pdf_extract_text = _pdf_extract_text
+    PDF_BACKEND = "pdfminer"
+except Exception:
+    try:
+        from PyPDF2 import PdfReader  # fallback if available
+        PDF_BACKEND = "pypdf2"
+    except Exception:
+        PDF_BACKEND = "none"
+
+Document = None
+try:
+    from docx import Document as _Document
+    Document = _Document
+    DOCX_BACKEND = "python-docx"
+except Exception:
+    DOCX_BACKEND = "none"
+
+# =============================================================================
+# Optional LangChain / Azure OpenAI (guarded)
+# =============================================================================
+HAVE_LANGCHAIN = False
+Tool = None
+AzureChatOpenAI = None
+initialize_agent = None
+AgentType = None
+ConversationBufferMemory = None
+
+try:
+    from langchain.tools import Tool as _Tool
+    from langchain.agents import initialize_agent as _initialize_agent, AgentType as _AgentType
+    from langchain_openai.chat_models.azure import AzureChatOpenAI as _AzureChatOpenAI
+    from langchain.memory import ConversationBufferMemory as _ConversationBufferMemory
+
+    Tool = _Tool
+    initialize_agent = _initialize_agent
+    AgentType = _AgentType
+    AzureChatOpenAI = _AzureChatOpenAI
+    ConversationBufferMemory = _ConversationBufferMemory
+    HAVE_LANGCHAIN = True
+except Exception:
+    HAVE_LANGCHAIN = False
+
+# =============================================================================
 # Config — tweak for your domain
-# =========================
+# =============================================================================
 MAX_FILES = 10
 DEFAULT_JOB_ID = "REQ-POC-0001"
 
@@ -35,13 +78,14 @@ SKILL_KEYWORDS = {
     "microservices": 1.5, "ml": 1.5, "ai": 1.5, "rag": 1.7, "langchain": 1.2,
     "compliance": 1.0, "hipaa": 1.0, "gdpr": 0.8, "soc2": 0.8
 }
-EDU_KEYWORDS = {"phd":1.0,"master":0.7,"ms ":0.7,"m.s.":0.7,"bachelor":0.5,"bs ":0.5,"b.s.":0.5,"associate":0.3,"associates":0.3}
-CLEARANCE_KEYWORDS = {"public trust":0.5,"secret":0.7,"top secret":0.9,"ts":0.9,"ts/sci":1.0,"sci":1.0}
-WEIGHTS = {"experience":0.35,"skills":0.40,"education":0.10,"clearance":0.15}
+EDU_KEYWORDS = {"phd": 1.0, "master": 0.7, "ms ": 0.7, "m.s.": 0.7, "bachelor": 0.5, "bs ": 0.5, "b.s.": 0.5,
+                "associate": 0.3, "associates": 0.3}
+CLEARANCE_KEYWORDS = {"public trust": 0.5, "secret": 0.7, "top secret": 0.9, "ts": 0.9, "ts/sci": 1.0, "sci": 1.0}
+WEIGHTS = {"experience": 0.35, "skills": 0.40, "education": 0.10, "clearance": 0.15}
 
-# =========================
+# =============================================================================
 # Data models
-# =========================
+# =============================================================================
 class Scores(BaseModel):
     experience: float
     skills: float
@@ -76,14 +120,13 @@ class OnboardingRequest(BaseModel):
     trace_id: str
     idempotency_key: str
 
-# =========================
+# =============================================================================
 # SQLite persistence
-# =========================
+# =============================================================================
 DB_DIR = Path("data")
 DB_DIR.mkdir(parents=True, exist_ok=True)
 DB_PATH = DB_DIR / "fedfusion.db"
 
-# Directory to persist raw resume text
 RESUME_DIR = DB_DIR / "resumes"
 RESUME_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -150,10 +193,8 @@ def db_upsert_candidate(c: CandidateScored):
 
 def db_set_idempo(key: str, result: dict):
     with db_conn() as con:
-        con.execute(
-            "INSERT OR IGNORE INTO idempotency(idempotency_key, result_json) VALUES(?,?)",
-            (key, json.dumps(result))
-        )
+        con.execute("INSERT OR IGNORE INTO idempotency(idempotency_key, result_json) VALUES(?,?)",
+                    (key, json.dumps(result)))
         con.commit()
 
 def db_get_idempo(key: str) -> Optional[dict]:
@@ -208,9 +249,9 @@ def db_load_dlq_df() -> pd.DataFrame:
     with db_conn() as con:
         return pd.read_sql_query("SELECT * FROM dlq", con)
 
-# =========================
+# =============================================================================
 # Session state cache (mirrors DB for fast UI)
-# =========================
+# =============================================================================
 def init_state():
     if "candidates" not in st.session_state:
         st.session_state.candidates = {}
@@ -228,16 +269,33 @@ def load_from_db():
 def log_event(kind: str, **kv):
     db_log_event(kind, kv)
 
-# =========================
+# =============================================================================
 # Resume parsing & scoring
-# =========================
+# =============================================================================
 def read_docx_bytes(b: bytes) -> str:
+    if Document is None:
+        raise ValueError("DOCX parsing requires 'python-docx' in requirements.")
     f = io.BytesIO(b)
     doc = Document(f)
     return "\n".join(p.text for p in doc.paragraphs)
 
 def read_pdf_bytes(b: bytes) -> str:
-    return pdf_extract_text(io.BytesIO(b)) or ""
+    if PDF_BACKEND == "pdfminer" and pdf_extract_text is not None:
+        return pdf_extract_text(io.BytesIO(b)) or ""
+    elif PDF_BACKEND == "pypdf2":
+        try:
+            from PyPDF2 import PdfReader
+            rd = PdfReader(io.BytesIO(b))
+            text = []
+            for p in rd.pages:
+                try:
+                    text.append(p.extract_text() or "")
+                except Exception:
+                    pass
+            return "\n".join(text)
+        except Exception:
+            pass
+    raise ValueError("PDF parsing requires 'pdfminer.six' or 'PyPDF2' in requirements.")
 
 def read_txt_bytes(b: bytes) -> str:
     try:
@@ -323,10 +381,7 @@ def total_score(parts: Scores) -> float:
 def make_candidate_from_resume(upload, job_id: str = DEFAULT_JOB_ID) -> CandidateScored:
     text, full_name = extract_text_from_upload(upload)
 
-    # derive candidate_id early so we can persist text deterministically
     candidate_id = Path(upload.name).stem.lower()
-
-    # persist raw resume text and create a file:// uri
     resume_path = _save_resume_text(candidate_id, text)
     resume_uri = f"file://{resume_path}"
 
@@ -350,22 +405,20 @@ def make_candidate_from_resume(upload, job_id: str = DEFAULT_JOB_ID) -> Candidat
         resume_uri=resume_uri,
         scores=scores,
         total_score=round(total, 2),
-        rank=0,  # set after sorting
+        rank=0,
         fields=Fields(skills=skills_list, years_experience=years, location=detect_location(text)),
         idempotency_key=idem,
         job_id=job_id,
         trace_id=str(uuid.uuid4())
     )
 
-# =========================
+# =============================================================================
 # Core ops (idempotent ingest + approve/orchestrate)
-# =========================
+# =============================================================================
 def upsert_candidate(payload: CandidateScored):
-    # cross-run idempotency: check DB first
     prior = db_get_idempo(payload.idempotency_key)
     if prior:
         return prior
-    # in-run cache
     if payload.idempotency_key in st.session_state.idempo:
         return st.session_state.idempo[payload.idempotency_key]
 
@@ -397,8 +450,7 @@ def simulate_jira_create(orq: OnboardingRequest):
     cache_key = orq.idempotency_key
     if cache_key in st.session_state.jira_cache:
         return st.session_state.jira_cache[cache_key]
-    # simulate occasional failure -> DLQ after retries
-    if random.random() < 0.05:
+    if random.random() < 0.05:  # 5% failure -> DLQ after retries
         db_log_dlq("Jira500", orq.model_dump())
         raise RuntimeError("Simulated Jira 500")
 
@@ -444,28 +496,16 @@ def approve_and_orchestrate(candidate_id: str, start_date: str):
                 return {"ok": False, "error": str(e), "trace_id": orq.trace_id, "tries": tries}
             time.sleep(0.6 * tries)
 
-# =========================
+# =============================================================================
 # Boot
-# =========================
+# =============================================================================
 db_init()
 init_state()
 load_from_db()
 
-# =========================
-# Sidebar — DLQ & notes
-# =========================
-st.sidebar.header("Queues")
-dlq_df = db_load_dlq_df()
-if not dlq_df.empty:
-    st.sidebar.dataframe(dlq_df.tail(30), use_container_width=True, height=240)
-else:
-    st.sidebar.write("DLQ is empty")
-st.sidebar.markdown("---")
-st.sidebar.caption("POC: files parsed in-memory; data persisted to ./data/fedfusion.db")
-
-# =========================
-# Tools for the agent
-# =========================
+# =============================================================================
+# Tools for the agent (callable both by LLM agent and fallback router)
+# =============================================================================
 def tool_list_candidates(job_id: str = "") -> str:
     try:
         cands = db_load_all_candidates()
@@ -488,10 +528,9 @@ def tool_get_candidate(candidate_id: str) -> str:
     try:
         if candidate_id not in st.session_state.candidates:
             load_from_db()
-
         rec = st.session_state.candidates.get(candidate_id)
         if not rec:
-            # fallback: fuzzy full name contains
+            # fallback: fuzzy full-name contains
             allc = db_load_all_candidates()
             lowered = candidate_id.lower()
             matches = [c for c in allc.values() if lowered in c.get("full_name","").lower()]
@@ -507,7 +546,6 @@ def tool_get_candidate(candidate_id: str) -> str:
                 }, indent=2)
             else:
                 return f"Candidate '{candidate_id}' not found."
-
         c_short = {k: rec[k] for k in ("candidate_id","full_name","email","job_id","status","total_score","rank")}
         c_short["fields"] = rec.get("fields", {})
         c_short["scores"] = rec.get("scores", {})
@@ -523,20 +561,16 @@ def tool_explain_scoring(candidate_id: str) -> str:
         rec = st.session_state.candidates.get(candidate_id)
         if not rec:
             return f"Candidate '{candidate_id}' not found."
-
         fields = rec.get("fields", {})
         scores = rec.get("scores", {})
         found_skills = sorted(fields.get("skills", []))
         years = fields.get("years_experience", 0)
-
-        raw_skill_sum = 0.0
-        per_skill = []
+        raw_skill_sum, per_skill = 0.0, []
         for k, w in SKILL_KEYWORDS.items():
             if k in found_skills:
                 raw_skill_sum += w
                 per_skill.append({"skill": k, "weight": w})
         normalized_skills = min(raw_skill_sum / 10.0, 1.0)
-
         breakdown = {
             "candidate_id": candidate_id,
             "name": rec.get("full_name"),
@@ -544,7 +578,8 @@ def tool_explain_scoring(candidate_id: str) -> str:
             "weights": WEIGHTS,
             "components": {
                 "experience": {"years": years, "score": scores.get("experience", 0.0)},
-                "skills": {"skills_found": found_skills, "per_skill_weights": per_skill, "normalized_score": scores.get("skills", normalized_skills)},
+                "skills": {"skills_found": found_skills, "per_skill_weights": per_skill,
+                           "normalized_score": scores.get("skills", normalized_skills)},
                 "education": {"score": scores.get("education", 0.0)},
                 "clearance": {"score": scores.get("clearance", 0.0)}
             },
@@ -562,7 +597,6 @@ def tool_show_resume(candidate_id: str, max_chars: int = 1200) -> str:
         rec = st.session_state.candidates.get(candidate_id)
         if not rec:
             return f"Candidate '{candidate_id}' not found."
-
         uri = rec.get("resume_uri", "")
         if uri.startswith("file://"):
             path = uri.replace("file://", "")
@@ -590,6 +624,10 @@ def tool_onboard_candidate(candidate_id: str, start_date: str) -> str:
             load_from_db()
             if candidate_id not in st.session_state.candidates:
                 return f"Candidate {candidate_id} not found in session or DB."
+        # Normalize MM-DD-YYYY -> YYYY-MM-DD for consistency
+        if re.match(r"^\d{2}-\d{2}-\d{4}$", start_date):
+            mm, dd, yyyy = start_date.split("-")
+            start_date = f"{yyyy}-{mm}-{dd}"
         res = approve_and_orchestrate(candidate_id, start_date)
         return json.dumps(res, indent=2)
     except Exception as e:
@@ -615,85 +653,124 @@ def tool_show_dlq(limit: int = 20) -> str:
     except Exception as e:
         return f"ERROR loading DLQ: {e}"
 
-tools = [
-    Tool(
-        name="list_candidates",
-        func=tool_list_candidates,
-        description="List candidates (optionally filter by job_id). Returns top 30 by score.\nUsage: list_candidates('REQ-POC-0001') or list_candidates('')"
-    ),
-    Tool(
-        name="get_candidate",
-        func=tool_get_candidate,
-        description="Get a candidate record by candidate_id. Also supports fuzzy full-name lookup when ambiguous.\nUsage: get_candidate('john_doe') or get_candidate('Monique')"
-    ),
-    Tool(
-        name="explain_scoring",
-        func=tool_explain_scoring,
-        description="Explain how a candidate's score was computed, with component breakdown, weights, and skills found.\nUsage: explain_scoring('john_doe')"
-    ),
-    Tool(
-        name="show_resume",
-        func=tool_show_resume,
-        description="Preview the raw resume text saved for a candidate (returns first N chars and the file path).\nUsage: show_resume('john_doe', 1500)"
-    ),
-    Tool(
-        name="onboard_candidate",
-        func=tool_onboard_candidate,
-        description="Approve and kick off onboarding (creates Jira epic). Args: candidate_id, start_date (YYYY-MM-DD or MM-DD-YYYY acceptable).\nUsage: onboard_candidate('john_doe','2025-10-01')"
-    ),
-    Tool(
-        name="show_events",
-        func=tool_show_events,
-        description="Show recent internal events. Optional arg: limit (int)."
-    ),
-    Tool(
-        name="show_dlq",
-        func=tool_show_dlq,
-        description="Show DLQ entries. Optional arg: limit (int)."
-    )
-]
+def tool_search_candidates(query: str) -> str:
+    """
+    Simple NL filters like:
+      - "min years 5 and skill kubernetes"
+      - "skill python and skill aws and min score 0.6"
+    """
+    try:
+        load_from_db()
+        m_years = re.search(r"min\s*years\s*(\d+)", query.lower())
+        m_score = re.search(r"min\s*score\s*(0?\.\d+|1\.0|1)", query.lower())
+        skills = re.findall(r"skill\s+([a-z0-9\+\.\-#]+)", query.lower())
+        min_years = int(m_years.group(1)) if m_years else 0
+        min_score = float(m_score.group(1)) if m_score else 0.0
+        want = set(skills)
+        rows = []
+        for c in st.session_state.candidates.values():
+            years = c.get("fields", {}).get("years_experience", 0)
+            score = c.get("total_score", 0.0)
+            sks = set(c.get("fields", {}).get("skills", []))
+            if years < min_years: 
+                continue
+            if score < min_score:
+                continue
+            if want and not want.issubset(sks):
+                continue
+            rows.append({
+                "candidate_id": c["candidate_id"],
+                "name": c["full_name"],
+                "years_exp": years,
+                "skills_found": sorted(list(sks)),
+                "total_score": score,
+                "rank": c["rank"],
+                "job_id": c["job_id"]
+            })
+        rows.sort(key=lambda r: (-r["total_score"], -r["years_exp"]))
+        return json.dumps(rows[:30], indent=2)
+    except Exception as e:
+        return f"ERROR searching candidates: {e}"
 
-# =========================
+# =============================================================================
+# Register LangChain tools (if available)
+# =============================================================================
+tools = []
+if HAVE_LANGCHAIN and Tool is not None:
+    tools = [
+        Tool(name="list_candidates",   func=tool_list_candidates,
+             description="List candidates (optionally filter by job_id). Returns top 30 by score. Usage: list_candidates('REQ-POC-0001')"),
+        Tool(name="get_candidate",     func=tool_get_candidate,
+             description="Get a candidate record by candidate_id (fuzzy full name supported). Usage: get_candidate('john_doe')"),
+        Tool(name="explain_scoring",   func=tool_explain_scoring,
+             description="Explain scoring breakdown for a candidate. Usage: explain_scoring('john_doe')"),
+        Tool(name="show_resume",       func=tool_show_resume,
+             description="Preview raw resume text for a candidate. Usage: show_resume('john_doe', 1500)"),
+        Tool(name="onboard_candidate", func=tool_onboard_candidate,
+             description="Approve & kick off onboarding. Args: candidate_id, start_date (YYYY-MM-DD or MM-DD-YYYY)."),
+        Tool(name="show_events",       func=tool_show_events,
+             description="Show recent internal events. Usage: show_events(20)"),
+        Tool(name="show_dlq",          func=tool_show_dlq,
+             description="Show DLQ entries. Usage: show_dlq(20)"),
+        Tool(name="search_candidates", func=tool_search_candidates,
+             description="Query by NL filters (min years, min score, skills). Usage: search_candidates('min years 5 and skill kubernetes')")
+    ]
+
+# =============================================================================
 # Chatbot: Azure LLM if available, else rule-based fallback
-# =========================
+# =============================================================================
 agent_executor = None
-try:
-    # requires AZURE_OPENAI_* env vars to be set
-    llm = AzureChatOpenAI(
-        deployment_name=os.getenv("AZURE_OPENAI_DEPLOYMENT"),
-        model=os.getenv("AZURE_OPENAI_DEPLOYMENT"),
-        api_version=os.getenv("AZURE_OPENAI_API_VERSION"),
-        temperature=0.0,
-        max_tokens=1024,
-    )
-    memory = ConversationBufferMemory(memory_key="chat_history", return_messages=True)
-    agent_executor = initialize_agent(
-        tools=tools,
-        llm=llm,
-        agent=AgentType.CONVERSATIONAL_REACT_DESCRIPTION,
-        memory=memory,
-        verbose=False
-    )
-except Exception:
-    agent_executor = None  # fall back below
+if HAVE_LANGCHAIN and AzureChatOpenAI is not None:
+    try:
+        llm = AzureChatOpenAI(
+            deployment_name=os.getenv("AZURE_OPENAI_DEPLOYMENT"),
+            model=os.getenv("AZURE_OPENAI_DEPLOYMENT"),
+            api_version=os.getenv("AZURE_OPENAI_API_VERSION"),
+            temperature=0.0,
+            max_tokens=1024,
+        )
+        memory = ConversationBufferMemory(memory_key="chat_history", return_messages=True)
+        agent_executor = initialize_agent(
+            tools=tools,
+            llm=llm,
+            agent=AgentType.CONVERSATIONAL_REACT_DESCRIPTION,
+            memory=memory,
+            verbose=False
+        )
+    except Exception:
+        agent_executor = None
+
+HELP_TEXT = (
+    "I can:\n"
+    "- list candidates [for JOB]\n"
+    "- get candidate CANDIDATE_ID\n"
+    "- explain scoring for CANDIDATE_ID\n"
+    "- show resume for CANDIDATE_ID\n"
+    "- onboard candidate CANDIDATE_ID on YYYY-MM-DD\n"
+    "- search candidates: 'min years 5 and skill kubernetes and min score 0.6'\n"
+    "- show events / show dlq\n"
+)
 
 def _fallback_router(msg: str) -> str:
-    """Deterministic mini intent parser that routes to tools when no LLM is configured."""
     m = msg.strip().lower()
 
+    # search candidates (NL filters)
+    if "min years" in m or "min score" in m or "skill " in m:
+        return tool_search_candidates(msg)
+
     # list candidates
-    m_list = re.search(r"list (?:top\s*\d+\s*)?candidates(?: for ([\w\-]+))?", m)
+    m_list = re.search(r"list(?: top\s*\d+)? candidates(?: for ([\w\-]+))?", m)
     if m_list:
         job = m_list.group(1) or ""
         return tool_list_candidates(job)
 
     # explain scoring
-    m_explain = re.search(r"(explain|why).*scor(?:e|ing).* (?:for )?(?:candidate )?([a-z0-9_\-\.]+)", m)
+    m_explain = re.search(r"(explain|why).*scor(?:e|ing).*(?: for)?(?: candidate)? ([a-z0-9_\-\.]+)", m)
     if m_explain:
         return tool_explain_scoring(m_explain.group(2))
 
     # show resume
-    m_show = re.search(r"(show|open|view).* (?:resume|cv).* (?:for )?(?:candidate )?([a-z0-9_\-\.]+)", m)
+    m_show = re.search(r"(show|open|view).* (?:resume|cv).*(?: for)?(?: candidate)? ([a-z0-9_\-\.]+)", m)
     if m_show:
         return tool_show_resume(m_show.group(2), 1500)
 
@@ -703,34 +780,23 @@ def _fallback_router(msg: str) -> str:
         return tool_get_candidate(m_get.group(2))
 
     # onboard candidate with date
-    m_onb = re.search(r"(onboard|approve).* (?:candidate )?([a-z0-9_\-\.]+).*(?:on|starting)\s+(\d{4}-\d{2}-\d{2}|\d{2}-\d{2}-\d{4})", m)
+    m_onb = re.search(r"(onboard|approve).*(?: candidate)? ([a-z0-9_\-\.]+).*(?: on|starting)\s+(\d{4}-\d{2}-\d{2}|\d{2}-\d{2}-\d{4})", m)
     if m_onb:
         cid, date = m_onb.group(2), m_onb.group(3)
-        # normalize MM-DD-YYYY -> YYYY-MM-DD
-        if re.match(r"\d{2}-\d{2}-\d{4}", date):
+        if re.match(r"^\d{2}-\d{2}-\d{4}$", date):
             mm, dd, yyyy = date.split("-")
             date = f"{yyyy}-{mm}-{dd}"
         return tool_onboard_candidate(cid, date)
 
     # show dlq
-    if "show dlq" in m or "dlq" in m:
+    if "show dlq" in m or m.strip() == "dlq":
         return tool_show_dlq(20)
 
     # show events
-    if "show events" in m or "events" in m:
+    if "show events" in m or m.strip() == "events":
         return tool_show_events(20)
 
-    # help
-    help_text = (
-        "I can: \n"
-        "- list candidates [for JOB]\n"
-        "- explain scoring for CANDIDATE_ID\n"
-        "- show resume for CANDIDATE_ID\n"
-        "- onboard candidate CANDIDATE_ID on YYYY-MM-DD\n"
-        "- show events / show dlq\n"
-        "Try: 'Explain scoring for candidate abc_resume'"
-    )
-    return help_text
+    return HELP_TEXT
 
 def run_agent(user_prompt: str) -> str:
     if agent_executor:
@@ -738,12 +804,11 @@ def run_agent(user_prompt: str) -> str:
             return agent_executor.run(user_prompt)
         except Exception as e:
             return f"Agent error: {e}"
-    else:
-        return _fallback_router(user_prompt)
+    return _fallback_router(user_prompt)
 
-# =========================
+# =============================================================================
 # Main UI
-# =========================
+# =============================================================================
 tab_chatbot, tab_upload, tab_list, tab_record, tab_dash = st.tabs(
     ["Chatbot", "Upload & Score", "Candidates", "Record", "Dashboards"]
 )
@@ -751,10 +816,11 @@ tab_chatbot, tab_upload, tab_list, tab_record, tab_dash = st.tabs(
 with tab_chatbot:
     st.subheader("Agentic chatbot — ask about candidates & orchestrate onboarding")
     st.markdown(
-        "Examples: \n"
+        "Examples:\n"
         "- `List top 5 candidates for REQ-POC-0001`\n"
         "- `Explain scoring for candidate abc_resume`\n"
         "- `Show resume for candidate abc_resume`\n"
+        "- `Search: min years 5 and skill kubernetes and min score 0.6`\n"
         "- `Onboard candidate abc_resume on 2025-10-01`\n"
         "- `Show DLQ`"
     )
@@ -775,6 +841,7 @@ with tab_chatbot:
 
 with tab_upload:
     st.subheader("Upload resumes (PDF, DOCX, or TXT)")
+    st.caption(f"PDF backend: {PDF_BACKEND} • DOCX backend: {DOCX_BACKEND}")
     uploads = st.file_uploader("Select up to 10 files", type=["pdf","docx","txt"], accept_multiple_files=True)
     job_id = st.text_input("Job ID", value=DEFAULT_JOB_ID)
     col1, col2 = st.columns([1,1])
@@ -806,7 +873,6 @@ with tab_upload:
                     c.rank = i
                     upsert_candidate(c)
 
-                # Display scored table with filters
                 rows = []
                 for c in created:
                     if c.fields.years_experience < min_years:
@@ -881,10 +947,10 @@ with tab_record:
             start_date = st.date_input("Start date").isoformat()
             if st.button("Approve → Kick off Jira"):
                 res = approve_and_orchestrate(chosen, start_date)
-                if res["ok"]:
+                if res.get("ok"):
                     st.success(f"Created Epic {res['epic']} with {len(res['tasks'])} tasks (trace: {res['trace_id']}, tries={res['tries']}).")
                 else:
-                    st.error(f"Failed: {res['error']} (trace: {res['trace_id']}, tries={res['tries']}). See DLQ in sidebar.")
+                    st.error(f"Failed: {res.get('error')} (trace: {res.get('trace_id')}, tries={res.get('tries')}). See DLQ in sidebar.")
 
 with tab_dash:
     st.subheader("Dashboards")
@@ -897,3 +963,11 @@ with tab_dash:
         st.write("Counts by kind")
         st.bar_chart(ev["kind"].value_counts())
 
+st.sidebar.header("Queues")
+dlq_df = db_load_dlq_df()
+if not dlq_df.empty:
+    st.sidebar.dataframe(dlq_df.tail(30), use_container_width=True, height=240)
+else:
+    st.sidebar.write("DLQ is empty")
+st.sidebar.markdown("---")
+st.sidebar.caption("POC data persisted to ./data/fedfusion.db • Resumes saved to ./data/resumes/*.txt")
