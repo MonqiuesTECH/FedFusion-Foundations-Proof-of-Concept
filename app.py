@@ -1,7 +1,7 @@
 # app.py
 import streamlit as st
 import pandas as pd
-from pydantic import BaseModel, ValidationError, constr
+from pydantic import BaseModel, constr
 from typing import Dict, List, Optional, Tuple
 from datetime import datetime
 from pathlib import Path
@@ -10,6 +10,15 @@ import hashlib, uuid, time, random, re, io, json, os, sqlite3
 # ---- resume parsers
 from pdfminer.high_level import extract_text as pdf_extract_text
 from docx import Document
+
+# LangChain (optional — we gracefully fall back if Azure/OpenAI env isn't set)
+from langchain.tools import Tool
+from langchain.agents import initialize_agent, AgentType
+from langchain_openai.chat_models.azure import AzureChatOpenAI
+from langchain.memory import ConversationBufferMemory
+
+from dotenv import load_dotenv
+load_dotenv()
 
 st.set_page_config(page_title="FedFusion POC", layout="wide")
 
@@ -74,6 +83,10 @@ DB_DIR = Path("data")
 DB_DIR.mkdir(parents=True, exist_ok=True)
 DB_PATH = DB_DIR / "fedfusion.db"
 
+# Directory to persist raw resume text
+RESUME_DIR = DB_DIR / "resumes"
+RESUME_DIR.mkdir(parents=True, exist_ok=True)
+
 def db_conn():
     return sqlite3.connect(DB_PATH)
 
@@ -137,8 +150,10 @@ def db_upsert_candidate(c: CandidateScored):
 
 def db_set_idempo(key: str, result: dict):
     with db_conn() as con:
-        con.execute("INSERT OR IGNORE INTO idempotency(idempotency_key, result_json) VALUES(?,?)",
-                    (key, json.dumps(result)))
+        con.execute(
+            "INSERT OR IGNORE INTO idempotency(idempotency_key, result_json) VALUES(?,?)",
+            (key, json.dumps(result))
+        )
         con.commit()
 
 def db_get_idempo(key: str) -> Optional[dict]:
@@ -157,7 +172,11 @@ def db_update_jira(candidate_id: str, epic: str, tasks: List[str], status: str):
 
 def db_load_all_candidates() -> Dict[str, dict]:
     with db_conn() as con:
-        cur = con.execute("SELECT candidate_id, full_name, email, resume_uri, scores_json, total_score, rank, fields_json, job_id, status, jira_epic, jira_tasks_json, trace_id, idempotency_key, created_at FROM candidates")
+        cur = con.execute("""
+            SELECT candidate_id, full_name, email, resume_uri, scores_json, total_score, rank,
+                   fields_json, job_id, status, jira_epic, jira_tasks_json, trace_id, idempotency_key, created_at
+            FROM candidates
+        """)
         out = {}
         for row in cur.fetchall():
             out[row[0]] = {
@@ -199,10 +218,11 @@ def init_state():
         st.session_state.idempo = {}
     if "jira_cache" not in st.session_state:
         st.session_state.jira_cache = {}
+    if "agent_messages" not in st.session_state:
+        st.session_state.agent_messages = []
 
 def load_from_db():
     st.session_state.candidates = db_load_all_candidates()
-    # idempotency cache is only for current run; DB also stores results to prevent duplicates across restarts
     st.session_state.idempo = {}
 
 def log_event(kind: str, **kv):
@@ -240,6 +260,12 @@ def extract_text_from_upload(upload) -> Tuple[str, str]:
     first_line = next((ln.strip() for ln in text.splitlines() if ln.strip()), "")
     full_name = first_line if 2 <= len(first_line.split()) <= 5 and len(first_line) <= 100 else name_guess
     return text, full_name
+
+def _save_resume_text(candidate_id: str, text: str) -> str:
+    path = RESUME_DIR / f"{candidate_id}.txt"
+    with open(path, "w", encoding="utf-8", errors="ignore") as f:
+        f.write(text)
+    return str(path)
 
 def extract_years_experience(text: str) -> int:
     m = re.findall(r"(\d+)\s*(\+)?\s*(years|yrs|yr)", text.lower())
@@ -296,6 +322,14 @@ def total_score(parts: Scores) -> float:
 
 def make_candidate_from_resume(upload, job_id: str = DEFAULT_JOB_ID) -> CandidateScored:
     text, full_name = extract_text_from_upload(upload)
+
+    # derive candidate_id early so we can persist text deterministically
+    candidate_id = Path(upload.name).stem.lower()
+
+    # persist raw resume text and create a file:// uri
+    resume_path = _save_resume_text(candidate_id, text)
+    resume_uri = f"file://{resume_path}"
+
     years = extract_years_experience(text)
     skills_list = collect_skills(text)
     exp = score_experience(years)
@@ -307,12 +341,9 @@ def make_candidate_from_resume(upload, job_id: str = DEFAULT_JOB_ID) -> Candidat
     total = total_score(scores)
 
     email_guess = f"{full_name.replace(' ','.').lower()}@example.gov" if full_name else "unknown@example.gov"
-    candidate_id = Path(upload.name).stem.lower()
-    resume_uri = f"uploaded://{upload.name}"
-
     idem = hashlib.sha256(f"{candidate_id}|{job_id}|{len(text)}".encode()).hexdigest()
 
-    cand = CandidateScored(
+    return CandidateScored(
         candidate_id=candidate_id,
         full_name=full_name or candidate_id,
         email=email_guess,
@@ -325,7 +356,6 @@ def make_candidate_from_resume(upload, job_id: str = DEFAULT_JOB_ID) -> Candidat
         job_id=job_id,
         trace_id=str(uuid.uuid4())
     )
-    return cand
 
 # =========================
 # Core ops (idempotent ingest + approve/orchestrate)
@@ -335,7 +365,7 @@ def upsert_candidate(payload: CandidateScored):
     prior = db_get_idempo(payload.idempotency_key)
     if prior:
         return prior
-    # in-run cache (not required but fast)
+    # in-run cache
     if payload.idempotency_key in st.session_state.idempo:
         return st.session_state.idempo[payload.idempotency_key]
 
@@ -434,9 +464,314 @@ st.sidebar.markdown("---")
 st.sidebar.caption("POC: files parsed in-memory; data persisted to ./data/fedfusion.db")
 
 # =========================
+# Tools for the agent
+# =========================
+def tool_list_candidates(job_id: str = "") -> str:
+    try:
+        cands = db_load_all_candidates()
+        vals = list(cands.values())
+        if job_id:
+            vals = [c for c in vals if c["job_id"] == job_id]
+        brief = [{
+            "candidate_id": c["candidate_id"],
+            "name": c["full_name"],
+            "total_score": c["total_score"],
+            "rank": c["rank"],
+            "status": c["status"],
+            "job_id": c["job_id"]
+        } for c in sorted(vals, key=lambda r: (-r["total_score"], r["rank"]))][:30]
+        return json.dumps(brief, indent=2)
+    except Exception as e:
+        return f"ERROR listing candidates: {e}"
+
+def tool_get_candidate(candidate_id: str) -> str:
+    try:
+        if candidate_id not in st.session_state.candidates:
+            load_from_db()
+
+        rec = st.session_state.candidates.get(candidate_id)
+        if not rec:
+            # fallback: fuzzy full name contains
+            allc = db_load_all_candidates()
+            lowered = candidate_id.lower()
+            matches = [c for c in allc.values() if lowered in c.get("full_name","").lower()]
+            if len(matches) == 1:
+                rec = matches[0]
+            elif len(matches) > 1:
+                return json.dumps({
+                    "note": f"Multiple matches for '{candidate_id}'. Provide an exact candidate_id.",
+                    "candidates": [
+                        {"candidate_id": c["candidate_id"], "full_name": c["full_name"], "total_score": c["total_score"]}
+                        for c in sorted(matches, key=lambda r: (-r["total_score"], r["rank"]))
+                    ][:15]
+                }, indent=2)
+            else:
+                return f"Candidate '{candidate_id}' not found."
+
+        c_short = {k: rec[k] for k in ("candidate_id","full_name","email","job_id","status","total_score","rank")}
+        c_short["fields"] = rec.get("fields", {})
+        c_short["scores"] = rec.get("scores", {})
+        c_short["resume_uri"] = rec.get("resume_uri")
+        return json.dumps(c_short, indent=2)
+    except Exception as e:
+        return f"ERROR getting candidate: {e}"
+
+def tool_explain_scoring(candidate_id: str) -> str:
+    try:
+        if candidate_id not in st.session_state.candidates:
+            load_from_db()
+        rec = st.session_state.candidates.get(candidate_id)
+        if not rec:
+            return f"Candidate '{candidate_id}' not found."
+
+        fields = rec.get("fields", {})
+        scores = rec.get("scores", {})
+        found_skills = sorted(fields.get("skills", []))
+        years = fields.get("years_experience", 0)
+
+        raw_skill_sum = 0.0
+        per_skill = []
+        for k, w in SKILL_KEYWORDS.items():
+            if k in found_skills:
+                raw_skill_sum += w
+                per_skill.append({"skill": k, "weight": w})
+        normalized_skills = min(raw_skill_sum / 10.0, 1.0)
+
+        breakdown = {
+            "candidate_id": candidate_id,
+            "name": rec.get("full_name"),
+            "job_id": rec.get("job_id"),
+            "weights": WEIGHTS,
+            "components": {
+                "experience": {"years": years, "score": scores.get("experience", 0.0)},
+                "skills": {"skills_found": found_skills, "per_skill_weights": per_skill, "normalized_score": scores.get("skills", normalized_skills)},
+                "education": {"score": scores.get("education", 0.0)},
+                "clearance": {"score": scores.get("clearance", 0.0)}
+            },
+            "total_score": rec.get("total_score"),
+            "rank": rec.get("rank")
+        }
+        return json.dumps(breakdown, indent=2)
+    except Exception as e:
+        return f"ERROR explaining scoring: {e}"
+
+def tool_show_resume(candidate_id: str, max_chars: int = 1200) -> str:
+    try:
+        if candidate_id not in st.session_state.candidates:
+            load_from_db()
+        rec = st.session_state.candidates.get(candidate_id)
+        if not rec:
+            return f"Candidate '{candidate_id}' not found."
+
+        uri = rec.get("resume_uri", "")
+        if uri.startswith("file://"):
+            path = uri.replace("file://", "")
+            if os.path.exists(path):
+                with open(path, "r", encoding="utf-8", errors="ignore") as f:
+                    text = f.read()
+                snippet = text[:max_chars]
+                return json.dumps({
+                    "candidate_id": candidate_id,
+                    "name": rec.get("full_name"),
+                    "resume_path": path,
+                    "preview_chars": len(snippet),
+                    "total_chars": len(text),
+                    "preview": snippet
+                }, indent=2)
+            return f"Resume file not found on disk: {path}"
+        else:
+            return f"Resume URI not resolvable: {uri}"
+    except Exception as e:
+        return f"ERROR showing resume: {e}"
+
+def tool_onboard_candidate(candidate_id: str, start_date: str) -> str:
+    try:
+        if candidate_id not in st.session_state.candidates:
+            load_from_db()
+            if candidate_id not in st.session_state.candidates:
+                return f"Candidate {candidate_id} not found in session or DB."
+        res = approve_and_orchestrate(candidate_id, start_date)
+        return json.dumps(res, indent=2)
+    except Exception as e:
+        return f"ERROR onboarding candidate: {e}"
+
+def tool_show_events(limit: int = 20) -> str:
+    try:
+        df = db_load_events_df()
+        if df.empty:
+            return "No events recorded."
+        out = df.tail(limit).to_dict(orient="records")
+        return json.dumps(out, default=str, indent=2)
+    except Exception as e:
+        return f"ERROR loading events: {e}"
+
+def tool_show_dlq(limit: int = 20) -> str:
+    try:
+        df = db_load_dlq_df()
+        if df.empty:
+            return "DLQ is empty."
+        out = df.tail(limit).to_dict(orient="records")
+        return json.dumps(out, default=str, indent=2)
+    except Exception as e:
+        return f"ERROR loading DLQ: {e}"
+
+tools = [
+    Tool(
+        name="list_candidates",
+        func=tool_list_candidates,
+        description="List candidates (optionally filter by job_id). Returns top 30 by score.\nUsage: list_candidates('REQ-POC-0001') or list_candidates('')"
+    ),
+    Tool(
+        name="get_candidate",
+        func=tool_get_candidate,
+        description="Get a candidate record by candidate_id. Also supports fuzzy full-name lookup when ambiguous.\nUsage: get_candidate('john_doe') or get_candidate('Monique')"
+    ),
+    Tool(
+        name="explain_scoring",
+        func=tool_explain_scoring,
+        description="Explain how a candidate's score was computed, with component breakdown, weights, and skills found.\nUsage: explain_scoring('john_doe')"
+    ),
+    Tool(
+        name="show_resume",
+        func=tool_show_resume,
+        description="Preview the raw resume text saved for a candidate (returns first N chars and the file path).\nUsage: show_resume('john_doe', 1500)"
+    ),
+    Tool(
+        name="onboard_candidate",
+        func=tool_onboard_candidate,
+        description="Approve and kick off onboarding (creates Jira epic). Args: candidate_id, start_date (YYYY-MM-DD or MM-DD-YYYY acceptable).\nUsage: onboard_candidate('john_doe','2025-10-01')"
+    ),
+    Tool(
+        name="show_events",
+        func=tool_show_events,
+        description="Show recent internal events. Optional arg: limit (int)."
+    ),
+    Tool(
+        name="show_dlq",
+        func=tool_show_dlq,
+        description="Show DLQ entries. Optional arg: limit (int)."
+    )
+]
+
+# =========================
+# Chatbot: Azure LLM if available, else rule-based fallback
+# =========================
+agent_executor = None
+try:
+    # requires AZURE_OPENAI_* env vars to be set
+    llm = AzureChatOpenAI(
+        deployment_name=os.getenv("AZURE_OPENAI_DEPLOYMENT"),
+        model=os.getenv("AZURE_OPENAI_DEPLOYMENT"),
+        api_version=os.getenv("AZURE_OPENAI_API_VERSION"),
+        temperature=0.0,
+        max_tokens=1024,
+    )
+    memory = ConversationBufferMemory(memory_key="chat_history", return_messages=True)
+    agent_executor = initialize_agent(
+        tools=tools,
+        llm=llm,
+        agent=AgentType.CONVERSATIONAL_REACT_DESCRIPTION,
+        memory=memory,
+        verbose=False
+    )
+except Exception:
+    agent_executor = None  # fall back below
+
+def _fallback_router(msg: str) -> str:
+    """Deterministic mini intent parser that routes to tools when no LLM is configured."""
+    m = msg.strip().lower()
+
+    # list candidates
+    m_list = re.search(r"list (?:top\s*\d+\s*)?candidates(?: for ([\w\-]+))?", m)
+    if m_list:
+        job = m_list.group(1) or ""
+        return tool_list_candidates(job)
+
+    # explain scoring
+    m_explain = re.search(r"(explain|why).*scor(?:e|ing).* (?:for )?(?:candidate )?([a-z0-9_\-\.]+)", m)
+    if m_explain:
+        return tool_explain_scoring(m_explain.group(2))
+
+    # show resume
+    m_show = re.search(r"(show|open|view).* (?:resume|cv).* (?:for )?(?:candidate )?([a-z0-9_\-\.]+)", m)
+    if m_show:
+        return tool_show_resume(m_show.group(2), 1500)
+
+    # get candidate
+    m_get = re.search(r"(get|show).* (?:candidate|record)\s+([a-z0-9_\-\.]+)", m)
+    if m_get:
+        return tool_get_candidate(m_get.group(2))
+
+    # onboard candidate with date
+    m_onb = re.search(r"(onboard|approve).* (?:candidate )?([a-z0-9_\-\.]+).*(?:on|starting)\s+(\d{4}-\d{2}-\d{2}|\d{2}-\d{2}-\d{4})", m)
+    if m_onb:
+        cid, date = m_onb.group(2), m_onb.group(3)
+        # normalize MM-DD-YYYY -> YYYY-MM-DD
+        if re.match(r"\d{2}-\d{2}-\d{4}", date):
+            mm, dd, yyyy = date.split("-")
+            date = f"{yyyy}-{mm}-{dd}"
+        return tool_onboard_candidate(cid, date)
+
+    # show dlq
+    if "show dlq" in m or "dlq" in m:
+        return tool_show_dlq(20)
+
+    # show events
+    if "show events" in m or "events" in m:
+        return tool_show_events(20)
+
+    # help
+    help_text = (
+        "I can: \n"
+        "- list candidates [for JOB]\n"
+        "- explain scoring for CANDIDATE_ID\n"
+        "- show resume for CANDIDATE_ID\n"
+        "- onboard candidate CANDIDATE_ID on YYYY-MM-DD\n"
+        "- show events / show dlq\n"
+        "Try: 'Explain scoring for candidate abc_resume'"
+    )
+    return help_text
+
+def run_agent(user_prompt: str) -> str:
+    if agent_executor:
+        try:
+            return agent_executor.run(user_prompt)
+        except Exception as e:
+            return f"Agent error: {e}"
+    else:
+        return _fallback_router(user_prompt)
+
+# =========================
 # Main UI
 # =========================
-tab_upload, tab_list, tab_record, tab_dash = st.tabs(["Upload & Score", "Candidates", "Record", "Dashboards"])
+tab_chatbot, tab_upload, tab_list, tab_record, tab_dash = st.tabs(
+    ["Chatbot", "Upload & Score", "Candidates", "Record", "Dashboards"]
+)
+
+with tab_chatbot:
+    st.subheader("Agentic chatbot — ask about candidates & orchestrate onboarding")
+    st.markdown(
+        "Examples: \n"
+        "- `List top 5 candidates for REQ-POC-0001`\n"
+        "- `Explain scoring for candidate abc_resume`\n"
+        "- `Show resume for candidate abc_resume`\n"
+        "- `Onboard candidate abc_resume on 2025-10-01`\n"
+        "- `Show DLQ`"
+    )
+
+    for m in st.session_state.agent_messages:
+        with st.chat_message(m["role"]):
+            st.markdown(m["content"])
+
+    user_prompt = st.chat_input("Ask the agent (e.g., 'Explain scoring for candidate X')")
+    if user_prompt:
+        st.session_state.agent_messages.append({"role": "user", "content": user_prompt})
+        with st.chat_message("user"):
+            st.markdown(user_prompt)
+        with st.chat_message("assistant"):
+            agent_response = run_agent(user_prompt)
+            st.session_state.agent_messages.append({"role": "assistant", "content": agent_response})
+            st.markdown(agent_response)
 
 with tab_upload:
     st.subheader("Upload resumes (PDF, DOCX, or TXT)")
@@ -474,7 +809,7 @@ with tab_upload:
                 # Display scored table with filters
                 rows = []
                 for c in created:
-                    if c.fields.years_experience < min_years: 
+                    if c.fields.years_experience < min_years:
                         continue
                     if c.total_score < threshold:
                         continue
@@ -561,3 +896,4 @@ with tab_dash:
         st.dataframe(ev.tail(50), use_container_width=True)
         st.write("Counts by kind")
         st.bar_chart(ev["kind"].value_counts())
+
